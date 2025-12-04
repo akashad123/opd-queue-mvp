@@ -45,14 +45,25 @@ module.exports = {
   callNext(department) {
     const db = loadDB();
 
-    const queue = this.getQueue(department);
-    if (queue.length === 0) return null;
+    // Build the waiting queue from THIS db copy
+    const waitingQueue = db.tokens
+      .filter(t => t.department === department && t.status === "waiting")
+      .sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
 
-    const next = queue[0];
-    next.status = "in-progress";
+    if (waitingQueue.length === 0) return null;
 
-    saveDB(db);
-    return next;
+    // First token is the next one
+    const nextTokenId = waitingQueue[0].tokenId;
+
+    // Find it in db.tokens and update in-place
+    const token = db.tokens.find(t => t.tokenId === nextTokenId);
+    if (token) {
+      token.status = "in-progress";
+      saveDB(db); // persist change
+      return token;
+    }
+
+    return null;
   },
 
   updateStatus(tokenId, status) {
@@ -62,6 +73,9 @@ module.exports = {
     if (token) {
       token.status = status;
       saveDB(db);
+      return token;
     }
+
+    return null;
   }
 };
