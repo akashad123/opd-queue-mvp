@@ -152,7 +152,7 @@ body,html,#root {
 
 .waiting { background: #eef2ff; color: #475569; }
 .calling { background: #bfdbfe; color: #1d4ed8; }
-.inprogress { background: #fce7f3; color: #9f1239; } /* optional color */
+.inprogress { background: #fce7f3; color: #9f1239; }
 .completed { background: #bbf7d0; color: #15803d; }
 .noshow { background: #fecaca; color: #b91c1c; }
 

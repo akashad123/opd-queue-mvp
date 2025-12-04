@@ -2,40 +2,44 @@ import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 /**
- * Staff Dashboard - Full ready-to-paste file
+ * Staff Dashboard (ready-to-paste)
+ * Expects endpoints:
+ * GET  ${API_URL}/queue?department=...
+ * POST ${API_URL}/token/next          body: { department }
+ * POST ${API_URL}/token/update        body: { id, status }
  *
- * Endpoints used:
- * GET  /api/queue?department=<dept>
- * POST /api/token/next         body: { department }
- * POST /api/token/update       body: { id, status }
- *
- * Notes:
- * - Backend should accept 'department' query/body for counter-specific behavior.
- * - Status values used: waiting, calling, inprogress, completed, noshow
+ * Uses REACT_APP_API_URL from environment (falls back to empty string for same-origin).
  */
 
+const API_URL = process.env.REACT_APP_API_URL || ""; // e.g. http://localhost:5000
+
 /* interval hook */
-function useInterval(callback, delay) {
-  const savedRef = useRef();
-  useEffect(() => { savedRef.current = callback; }, [callback]);
+function useInterval(cb, delay) {
+  const ref = useRef();
+  useEffect(() => { ref.current = cb; }, [cb]);
   useEffect(() => {
     if (delay == null) return;
-    const id = setInterval(() => savedRef.current(), delay);
+    const id = setInterval(() => ref.current(), delay);
     return () => clearInterval(id);
   }, [delay]);
 }
 
-/* Status badge */
+/* status badge */
 function StatusBadge({ status }) {
   const s = (status || "waiting").toLowerCase();
-  const classes = {
+  const map = {
     waiting: "badge waiting",
     calling: "badge calling",
     inprogress: "badge inprogress",
     completed: "badge completed",
-    noshow: "badge noshow",
-  }[s] || "badge waiting";
-  return <span className={classes}>{s.toUpperCase()}</span>;
+    noshow: "badge noshow"
+  };
+  return <span className={map[s] || "badge waiting"}>{s.toUpperCase()}</span>;
+}
+
+/* Helper to normalize token id field (_id, id, tokenId) */
+function tokenIdOf(token) {
+  return token?.id ?? token?._id ?? token?.tokenId ?? null;
 }
 
 export default function App() {
@@ -45,20 +49,22 @@ export default function App() {
   const [error, setError] = useState(null);
   const [department, setDepartment] = useState("OPD");
 
-  // Adjust to your site's counters
+  // update this list if you have more counters
   const departments = ["Registration", "OPD", "Lab", "Pharmacy"];
 
   async function loadQueue() {
     setLoading(true);
     setError(null);
     try {
-      const url = `/api/queue${department ? `?department=${encodeURIComponent(department)}` : ""}`;
+      const url = `${API_URL}/queue${department ? `?department=${encodeURIComponent(department)}` : ""}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`Server ${res.status}`);
       const data = await res.json();
-      setQueue(Array.isArray(data) ? data : []);
+      // normalize if backend returns object { queue: [...] }
+      const list = Array.isArray(data) ? data : (Array.isArray(data.queue) ? data.queue : []);
+      setQueue(list);
     } catch (e) {
-      console.error("loadQueue error:", e);
+      console.error("loadQueue:", e);
       setError("Failed to fetch queue");
       setQueue([]);
     } finally {
@@ -66,19 +72,16 @@ export default function App() {
     }
   }
 
-  useEffect(() => {
-    loadQueue();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [department]);
+  useEffect(() => { loadQueue(); }, [department]);
 
-  // auto-refresh every 3 seconds
+  // Auto refresh every 3 seconds
   useInterval(() => { if (autoRefresh) loadQueue(); }, 3000);
 
-  // call next — send department so backend can choose correctly
+  // Call next for current department
   async function callNext() {
     setError(null);
     try {
-      const res = await fetch("/api/token/next", {
+      const res = await fetch(`${API_URL}/token/next`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ department })
@@ -86,25 +89,27 @@ export default function App() {
       if (!res.ok) throw new Error(`Server ${res.status}`);
       await loadQueue();
     } catch (e) {
-      console.error("callNext error:", e);
+      console.error("callNext:", e);
       setError("Failed to call next");
     }
   }
 
-  // update token status
-  async function updateStatus(id, status) {
-    if (!id) return;
-    // confirm for noshow or completed if you want
-    if (status === "noshow") {
-      if (!window.confirm("Mark this token as No-show?")) return;
+  // Update status (inprogress, completed, noshow, calling)
+  async function updateStatus(token, status) {
+    const id = tokenIdOf(token);
+    if (!id) {
+      console.warn("Missing token id:", token);
+      setError("Internal: token id missing");
+      return;
     }
-    setError(null);
 
-    // optimistic UI update: reflect change locally before fetch
-    setQueue(prev => prev.map(t => t.id === id ? { ...t, status } : t));
+    if (status === "noshow" && !window.confirm("Confirm mark token as No-show?")) return;
+
+    // optimistic update
+    setQueue(prev => prev.map(t => (tokenIdOf(t) === id ? { ...t, status } : t)));
 
     try {
-      const res = await fetch("/api/token/update", {
+      const res = await fetch(`${API_URL}/token/update`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id, status })
@@ -112,22 +117,21 @@ export default function App() {
       if (!res.ok) throw new Error(`Server ${res.status}`);
       await loadQueue();
     } catch (e) {
-      console.error("updateStatus error:", e);
+      console.error("updateStatus:", e);
       setError("Failed to update token");
-      // rollback by reloading
-      await loadQueue();
+      await loadQueue(); // rollback
     }
   }
 
-  // Client-side display sorting: priority first (if token.priority truthy), then calling/inprogress
+  // Client-side display ordering: priority first, then calling/inprogress
   const displayQueue = [...queue].sort((a, b) => {
     const pa = a.priority ? 1 : 0;
     const pb = b.priority ? 1 : 0;
-    if (pa !== pb) return pb - pa; // priority first
+    if (pa !== pb) return pb - pa;
 
-    const statusRank = { calling: 3, inprogress: 2, waiting: 1, completed: 0, noshow: 0 };
-    const sa = statusRank[(a.status || "waiting")] ?? 0;
-    const sb = statusRank[(b.status || "waiting")] ?? 0;
+    const rank = { calling: 3, inprogress: 2, waiting: 1, completed: 0, noshow: 0 };
+    const sa = rank[(a.status || "waiting")] ?? 0;
+    const sb = rank[(b.status || "waiting")] ?? 0;
     return sb - sa;
   });
 
@@ -153,10 +157,9 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
           <div>
             <h2 className="section-title">Live Queue Management</h2>
-            <p className="muted">Monitor patients, call next, and manage statuses in real time.</p>
+            <p className="muted">Monitor tokens and update statuses in real time.</p>
           </div>
 
-          {/* Department selection */}
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <label className="muted" style={{ marginRight: 6 }}>Counter</label>
             <select
@@ -169,7 +172,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* toolbar */}
         <div className="toolbar" style={{ marginTop: 12 }}>
           <button className="btn small grey" onClick={() => setAutoRefresh(v => !v)}>
             Auto Refresh: {autoRefresh ? "ON" : "OFF"}
@@ -184,37 +186,35 @@ export default function App() {
 
         {error && <p className="error">{error}</p>}
 
-        {/* queue table */}
         <table className="queue-table" style={{ marginTop: 12 }}>
           <thead>
             <tr>
-              <th>Token</th>
-              <th>Priority</th>
+              <th style={{ width: 140 }}>Token</th>
+              <th style={{ width: 120 }}>Priority</th>
               <th>Status</th>
-              <th>Action</th>
+              <th style={{ width: 360 }}>Action</th>
             </tr>
           </thead>
 
           <tbody>
             {displayQueue.length === 0 ? (
-              <tr>
-                <td colSpan="4" className="empty">No tokens in queue</td>
-              </tr>
-            ) : (
-              displayQueue.map(t => (
-                <tr key={t.id}>
-                  <td>#{t.id}</td>
+              <tr><td colSpan="4" className="empty">No tokens in queue</td></tr>
+            ) : displayQueue.map(t => {
+              const id = tokenIdOf(t);
+              return (
+                <tr key={id || Math.random()}>
+                  <td><strong>#{id}</strong></td>
                   <td>{t.priority ? <strong>HIGH</strong> : "Normal"}</td>
                   <td><StatusBadge status={t.status || "waiting"} /></td>
                   <td style={{ display: "flex", gap: 8 }}>
-                    <button className="btn grey small" onClick={() => updateStatus(t.id, "inprogress")}>In-progress</button>
-                    <button className="btn green small" onClick={() => updateStatus(t.id, "completed")}>Complete</button>
-                    <button className="btn red small" onClick={() => updateStatus(t.id, "noshow")}>No-show</button>
-                    <button className="btn blue small" onClick={() => updateStatus(t.id, "calling")}>Call</button>
+                    <button className="btn grey small" onClick={() => updateStatus(t, "inprogress")}>In-progress</button>
+                    <button className="btn green small" onClick={() => updateStatus(t, "completed")}>Complete</button>
+                    <button className="btn red small" onClick={() => updateStatus(t, "noshow")}>No-show</button>
+                    <button className="btn blue small" onClick={() => updateStatus(t, "calling")}>Call</button>
                   </td>
                 </tr>
-              ))
-            )}
+              );
+            })}
           </tbody>
         </table>
       </div>
