@@ -1,323 +1,333 @@
-import { useState, useEffect } from "react";
+// src/App.js
+import React, { useEffect, useState } from "react";
 import "./App.css";
 
-const DEPARTMENTS = ["OPD", "Lab", "Pharmacy"];
+/**
+ * Staff Dashboard - App.js
+ *
+ * Endpoints (backend):
+ * GET  ${API_URL}/queue?department=...
+ * POST ${API_URL}/token/next        body: { department }
+ * POST ${API_URL}/token/update      body: { id, tokenId, status }
+ */
 
-const getStatusClass = (status) => {
-  if (!status) return "status-waiting";
-  const key = status.toLowerCase();
-  if (key.includes("wait")) return "status-waiting";
-  if (["active", "called", "in progress"].includes(key)) return "status-active";
-  if (["completed", "done", "served"].includes(key)) return "status-completed";
-  return "status-waiting";
-};
+// Backend base: http://localhost:5000/api
+export const API_URL =
+  process.env.REACT_APP_API_URL || "http://localhost:5000/api";
 
-function App() {
-  const [department, setDepartment] = useState("OPD");
-  const [isPriority, setIsPriority] = useState(false);
-  const [tokenInfo, setTokenInfo] = useState(null);
+/* Helper to normalize token id field (_id, id, tokenId) */
+function tokenIdOf(token) {
+  return token?.id ?? token?._id ?? token?.tokenId ?? null;
+}
+
+/* Status badge */
+function StatusBadge({ status }) {
+  const s = (status || "waiting").toLowerCase();
+  const map = {
+    waiting: "badge waiting",
+    calling: "badge calling",
+    inprogress: "badge inprogress",
+    "in-progress": "badge inprogress",
+    completed: "badge completed",
+    noshow: "badge noshow",
+  };
+  return <span className={map[s] || "badge waiting"}>{s.toUpperCase()}</span>;
+}
+
+export default function App() {
+  const [queue, setQueue] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [error, setError] = useState(null);
+  const [department, setDepartment] = useState("OPD");
 
-  // Poll queue position every 3 seconds after token is created
-  useEffect(() => {
-    if (!tokenInfo) return;
+  const departments = ["Registration", "OPD", "Lab", "Pharmacy"];
 
-    const intervalId = setInterval(() => {
-      fetchQueuePosition();
-    }, 3000);
-
-    return () => clearInterval(intervalId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tokenInfo?.tokenId, department]);
-
-  const handleGenerateToken = async (e) => {
-    e.preventDefault();
+  // Load queue once (and when department changes)
+  async function loadQueue() {
     setLoading(true);
-    setError("");
-
+    setError(null);
     try {
-      const res = await fetch("/api/token/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          department,
-          priority: isPriority,
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error("Failed to generate token. Please try again.");
-      }
-
+      const url = `${API_URL}/queue${
+        department ? `?department=${encodeURIComponent(department)}` : ""
+      }`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Server ${res.status}`);
       const data = await res.json();
-      // Expected from backend: { tokenId, department, status, peopleAhead }
-      setTokenInfo({
-        tokenId: data.tokenId,
-        department: data.department || department,
-        status: data.status || "Waiting",
-        peopleAhead:
-          typeof data.peopleAhead === "number" ? data.peopleAhead : null,
-      });
-    } catch (err) {
-      setError(err.message || "Something went wrong");
+      const list = Array.isArray(data)
+        ? data
+        : Array.isArray(data.queue)
+        ? data.queue
+        : [];
+      setQueue(list);
+    } catch (e) {
+      console.error("loadQueue:", e);
+      setError("Failed to fetch queue");
+      setQueue([]);
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const fetchQueuePosition = async () => {
-    if (!tokenInfo?.tokenId) return;
+  useEffect(() => {
+    loadQueue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [department]);
+
+  // auto-refresh every 3 seconds
+  useEffect(() => {
+    if (!autoRefresh) return;
+
+    const id = setInterval(() => {
+      fetch(
+        `${API_URL}/queue?department=${encodeURIComponent(department)}`
+      )
+        .then((res) => {
+          if (!res.ok) throw new Error(`Server ${res.status}`);
+          return res.json();
+        })
+        .then((data) => {
+          const list = Array.isArray(data)
+            ? data
+            : Array.isArray(data.queue)
+            ? data.queue
+            : [];
+          setQueue(list);
+        })
+        .catch((err) => {
+          console.error("interval fetch error:", err);
+          setError("Failed to auto-refresh queue");
+        });
+    }, 3000);
+
+    return () => clearInterval(id);
+  }, [autoRefresh, department]);
+
+  // Call next for current department
+  async function callNext() {
+    setError(null);
+    try {
+      const res = await fetch(`${API_URL}/token/next`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ department }),
+      });
+      if (!res.ok) {
+        let txt = "";
+        try {
+          txt = await res.text();
+        } catch (_) {}
+        throw new Error(`Server ${res.status} ${txt}`);
+      }
+      await loadQueue();
+    } catch (e) {
+      console.error("callNext:", e);
+      setError("Failed to call next");
+    }
+  }
+
+  // Update status (sends both id & tokenId to support either backend)
+  async function updateStatus(token, status) {
+    const id = tokenIdOf(token);
+    if (!id) {
+      console.warn("Missing token id:", token);
+      setError("Internal: token id missing");
+      return;
+    }
+
+    if (
+      status === "noshow" &&
+      !window.confirm("Confirm mark token as No-show?")
+    )
+      return;
+
+    // optimistic UI update
+    setQueue((prev) =>
+      prev.map((t) => (tokenIdOf(t) === id ? { ...t, status } : t))
+    );
 
     try {
-      const res = await fetch(
-        `/api/queue?department=${encodeURIComponent(department)}`
-      );
-
+      const body = { id, tokenId: id, status };
+      const res = await fetch(`${API_URL}/token/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
       if (!res.ok) {
-        throw new Error("Unable to update queue position");
+        let txt = "";
+        try {
+          txt = await res.text();
+        } catch (_) {}
+        throw new Error(`Server ${res.status} ${txt}`);
       }
-
-      const data = await res.json();
-      setTokenInfo((prev) =>
-        prev
-          ? {
-              ...prev,
-              status: data.status || prev.status,
-              peopleAhead:
-                typeof data.peopleAhead === "number"
-                  ? data.peopleAhead
-                  : prev.peopleAhead,
-            }
-          : prev
-      );
-    } catch (err) {
-      console.error(err);
+      await loadQueue();
+    } catch (e) {
+      console.error("updateStatus:", e);
+      setError("Failed to update token");
+      await loadQueue(); // rollback
     }
-  };
+  }
 
-  const estimatedWait =
-    typeof tokenInfo?.peopleAhead === "number"
-      ? (tokenInfo.peopleAhead + 1) * 3 // approx 3 minutes per patient
-      : null;
+  // client-side ordering: priority first, then by status rank
+  const displayQueue = [...queue].sort((a, b) => {
+    const pa = a.priority ? 1 : 0;
+    const pb = b.priority ? 1 : 0;
+    if (pa !== pb) return pb - pa;
+    const rank = {
+      calling: 3,
+      inprogress: 2,
+      "in-progress": 2,
+      waiting: 1,
+      completed: 0,
+      noshow: 0,
+    };
+    const sa = rank[a.status || "waiting"] ?? 0;
+    const sb = rank[b.status || "waiting"] ?? 0;
+    return sb - sa;
+  });
 
   return (
-    <div className="app-shell">
-      {/* Top Navigation / Branding */}
-      <header className="top-nav">
-        <div className="nav-left">
-          <div className="nav-logo">H</div>
+    <div className="page">
+      {/* Header */}
+      <header className="header">
+        <div className="head-left">
+          <div className="logo">H</div>
           <div>
-            <div className="nav-title">CityCare Hospitals</div>
-            <div className="nav-subtitle">Outpatient Queue Management</div>
+            <h2 className="title">CityCare Hospitals</h2>
+            <p className="subtitle">Staff Queue Management</p>
           </div>
         </div>
-        <nav className="nav-links">
-          <span className="nav-link active">Patient Check-In</span>
-          <span className="nav-link">Departments</span>
-          <span className="nav-link">Help Desk</span>
+
+        <nav className="nav">
+          <div className="nav-item active">Staff Dashboard</div>
         </nav>
       </header>
 
-      {/* Main Content */}
-      <main className="main-layout">
-        {/* Left: Form & Info */}
-        <section className="left-panel">
-          <div className="hero">
-            <h1>Welcome to Self Check-In</h1>
-            <p>
-              Generate your token, track your position in the queue, and relax
-              while we prepare for your visit.
+      {/* Main card */}
+      <div className="card big-card">
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 12,
+            alignItems: "center",
+          }}
+        >
+          <div>
+            <h2 className="section-title">Live Queue Management</h2>
+            <p className="muted">
+              Monitor tokens and update statuses in real time.
             </p>
-
-            <div className="hero-badges">
-              <div className="hero-badge">
-                <span className="badge-dot live"></span>
-                Live queue updates every <strong>3 seconds</strong>
-              </div>
-              <div className="hero-badge">
-                <span className="badge-dot safe"></span>
-                Priority for <strong>senior citizens & emergencies</strong>
-              </div>
-            </div>
           </div>
 
-          <form className="form-card" onSubmit={handleGenerateToken}>
-            <div className="form-header">
-              <h2>Generate your token</h2>
-              <span className="form-tag">Step 1 of 2</span>
-            </div>
-
-            <div className="form-grid">
-              <div className="field">
-                <label htmlFor="department">Department</label>
-                <select
-                  id="department"
-                  value={department}
-                  onChange={(e) => setDepartment(e.target.value)}
-                >
-                  {DEPARTMENTS.map((d) => (
-                    <option key={d} value={d}>
-                      {d}
-                    </option>
-                  ))}
-                </select>
-                <p className="field-hint">
-                  Choose where you want to be seen today.
-                </p>
-              </div>
-
-              <div className="field priority-field">
-                <label>Priority</label>
-                <label className="toggle">
-                  <input
-                    type="checkbox"
-                    checked={isPriority}
-                    onChange={(e) => setIsPriority(e.target.checked)}
-                  />
-                  <span className="toggle-track">
-                    <span className="toggle-thumb" />
-                  </span>
-                  <span className="toggle-label">
-                    I am a senior citizen / emergency case
-                  </span>
-                </label>
-                <p className="field-hint">
-                  Priority tokens may be called earlier when medically needed.
-                </p>
-              </div>
-            </div>
-
-            <button className="btn-primary" type="submit" disabled={loading}>
-              {loading ? "Generating token..." : "Generate Token"}
-            </button>
-
-            {error && <p className="error">{error}</p>}
-
-            <div className="help-row">
-              <span>Need assistance?</span>
-              <button
-                type="button"
-                className="link-button"
-                onClick={() => alert("Please contact the help desk counter.")}
-              >
-                Speak to our help desk
-              </button>
-            </div>
-          </form>
-
-          <div className="info-strip">
-            <div>
-              <div className="info-label">Today&apos;s timings</div>
-              <div className="info-value">OPD 9:00 AM – 5:00 PM</div>
-            </div>
-            <div>
-              <div className="info-label">Average wait</div>
-              <div className="info-value">Approx. 10–20 mins</div>
-            </div>
-            <div>
-              <div className="info-label">Emergency</div>
-              <div className="info-value highlight">Dial 108 or visit ER</div>
-            </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <label className="muted" style={{ marginRight: 6 }}>
+              Counter
+            </label>
+            <select
+              value={department}
+              onChange={(e) => setDepartment(e.target.value)}
+              style={{
+                padding: 8,
+                borderRadius: 8,
+                border: "1px solid #eef2f7",
+                background: "#fff",
+              }}
+            >
+              {departments.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
           </div>
-        </section>
+        </div>
 
-        {/* Right: Token & Steps */}
-        <section className="right-panel">
-          <div className="token-card-wrapper">
-            <div className="panel-header">
-              <h2>Your visit today</h2>
-              <p>Keep this screen open while you wait for your turn.</p>
-            </div>
+        <div className="toolbar" style={{ marginTop: 12 }}>
+          <button
+            className="btn small grey"
+            onClick={() => setAutoRefresh((v) => !v)}
+          >
+            Auto Refresh: {autoRefresh ? "ON" : "OFF"}
+          </button>
 
-            {tokenInfo ? (
-              <div className="token-card">
-                <div className="token-main">
-                  <div>
-                    <div className="token-label">Token ID</div>
-                    <div className="token-id">{tokenInfo.tokenId}</div>
-                  </div>
-                  <div className="token-pill">
-                    {tokenInfo.department?.toUpperCase() || department}
-                  </div>
-                </div>
+          <button
+            className="btn small grey"
+            onClick={loadQueue}
+            disabled={loading}
+          >
+            {loading ? "Refreshing..." : "Refresh"}
+          </button>
 
-                <div className="token-meta-row">
-                  <div className="meta-block">
-                    <span className="meta-label">Status</span>
-                    <span
-                      className={`status-badge ${getStatusClass(
-                        tokenInfo.status
-                      )}`}
-                    >
-                      {tokenInfo.status}
-                    </span>
-                  </div>
-                  <div className="meta-block">
-                    <span className="meta-label">People ahead</span>
-                    <span className="meta-value">
-                      {tokenInfo.peopleAhead ?? "--"}
-                    </span>
-                  </div>
-                  <div className="meta-block">
-                    <span className="meta-label">Estimated wait</span>
-                    <span className="meta-value">
-                      {estimatedWait ? `${estimatedWait} mins` : "Calculating"}
-                    </span>
-                  </div>
-                </div>
+          <button className="btn primary small" onClick={callNext}>
+            Call Next
+          </button>
+        </div>
 
-                <div className="progress">
-                  <div className="progress-labels">
-                    <span>Token created</span>
-                    <span>Waiting</span>
-                    <span>At counter</span>
-                  </div>
-                  <div className="progress-bar">
-                    <span className="progress-fill" />
-                  </div>
-                </div>
+        {error && <p className="error">{error}</p>}
 
-                <p className="note">
-                  Please remain within hospital premises. Watch the display or
-                  listen for your token number. If you miss your call, visit the
-                  help desk.
-                </p>
-              </div>
+        <table className="queue-table" style={{ marginTop: 12 }}>
+          <thead>
+            <tr>
+              <th style={{ width: 140 }}>Token</th>
+              <th style={{ width: 120 }}>Priority</th>
+              <th>Status</th>
+              <th style={{ width: 360 }}>Action</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {displayQueue.length === 0 ? (
+              <tr>
+                <td colSpan="4" className="empty">
+                  No tokens in queue
+                </td>
+              </tr>
             ) : (
-              <div className="token-placeholder">
-                <h3>No token generated yet</h3>
-                <p>
-                  Fill in the form on the left and tap <strong>Generate</strong>{" "}
-                  to receive your token and live queue updates.
-                </p>
-                <ul>
-                  <li>Choose your department</li>
-                  <li>Mark priority if applicable</li>
-                  <li>Keep this page open while you wait</li>
-                </ul>
-              </div>
+              displayQueue.map((t) => {
+                const id = tokenIdOf(t);
+                return (
+                  <tr key={id || Math.random()}>
+                    <td>
+                      <strong>#{id}</strong>
+                    </td>
+                    <td>{t.priority ? <strong>HIGH</strong> : "Normal"}</td>
+                    <td>
+                      <StatusBadge status={t.status || "waiting"} />
+                    </td>
+                    <td style={{ display: "flex", gap: 8 }}>
+                      <button
+                        className="btn grey small"
+                        onClick={() => updateStatus(t, "inprogress")}
+                      >
+                        In-progress
+                      </button>
+                      <button
+                        className="btn green small"
+                        onClick={() => updateStatus(t, "completed")}
+                      >
+                        Complete
+                      </button>
+                      <button
+                        className="btn red small"
+                        onClick={() => updateStatus(t, "noshow")}
+                      >
+                        No-show
+                      </button>
+                      <button
+                        className="btn blue small"
+                        onClick={() => updateStatus(t, "calling")}
+                      >
+                        Call
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })
             )}
-          </div>
-
-          <div className="steps-card">
-            <h3>How it works</h3>
-            <ol>
-              <li>Generate your token using the self check-in form.</li>
-              <li>Track your place in the queue in real time.</li>
-              <li>
-                When your token is called, proceed to the department counter.
-              </li>
-            </ol>
-          </div>
-        </section>
-      </main>
-
-      <footer className="footer">
-        © {new Date().getFullYear()} CityCare Hospitals · All rights reserved
-      </footer>
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
-
-export default App;
